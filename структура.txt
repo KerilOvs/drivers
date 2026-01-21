@@ -1,0 +1,65 @@
+@startuml
+' Title
+title Serial Port Transmitter — Variant 3 (Structural Diagram)
+
+' Skin
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam roundcorner 5
+
+' Components
+actor "User Application\n(write_serial.exe)" as App
+
+component "Win32 API\nWriteFile" as WriteFile
+
+package "User-mode" {
+component "Write Thread\n(retry loop)" as UThread
+}
+
+package "KMDF Driver (serialport.sys)" {
+component "WDF DriverEntry\n(EvtDeviceAdd)" as DriverEntry
+component "Device Object\n(DEVICE_CONTEXT)" as DeviceCtx
+component "PNP/Power\nEvtDevicePrepareHardware\n(EvtDeviceReleaseHardware)" as PnP
+component "I/O Queue\nSerioQueueInitialize\nEvtIoWrite" as IoQueue
+component "Port I/O Layer\nportio_asm.h / READ/WRITE macros" as PortIO
+}
+
+database "COM1 I/O Port\n(base 0x3F8)" as COM1
+
+cloud "VirtualBox Serial Redirect\n(file / pipe)" as VBox
+
+rectangle "Debug & Validation\nDebugView / IrpTracker\nvb_serial_capture.bin" as Debug
+
+' Relationships / Flow
+App --> WriteFile : CreateFile/WriteFile("\\.\SerialPort")
+WriteFile --> UThread : pass buffer (1 byte per WriteFile)
+UThread --> IoQueue : IRP_MJ_WRITE (WDF request)
+IoQueue --> DeviceCtx : retrieve device context
+IoQueue --> PortIO : READ LSR (offset +5)
+PortIO --> COM1 : IN port (0x3F8+5)
+COM1 --> PortIO : return LSR (bits: THRE=0x20)
+IoQueue --> PortIO : WRITE THR (0x3F8) when THRE set
+PortIO --> COM1 : OUT port (0x3F8)
+IoQueue --> UThread : Complete Request (Information = 1 or 0)
+UThread --> App : WriteFile returns bytes written
+
+' PnP and init path
+DriverEntry --> PnP : register callbacks
+PnP --> DeviceCtx : set PortBase = 0x3F8, init params (9600,8,N,1)
+DeviceCtx --> PortIO : (optional) initial config writes (DLL/LCR)
+
+' Validation / Capture
+IoQueue --> Debug : KdPrint logs (attempt, LSR, write)
+COM1 --> VBox : VirtualBox captures port data to file/pipe
+VBox --> Debug : host file capture (vb_serial_capture.bin)
+IoQueue --> Debug : IrpTracker observes IRP_MJ_WRITE
+
+' Notes
+note right of IoQueue
+Cyclic polling loop:
+
+read LSR
+if (LSR & 0x20) write THR -> done
+else stall (KeStallExecutionProcessor) and retry (max attempts)
+end note
+@enduml

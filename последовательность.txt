@@ -1,0 +1,47 @@
+@startuml
+title Serial Port Transmitter — Variant 3 (Sequence Diagram)
+
+actor "User App\n(write_serial.exe)" as App
+participant "Win32 API\nCreateFile/WriteFile" as Win32
+participant "KMDF: WDF I/O Queue\nEvtIoWrite" as Driver
+participant "Device Context\n(PortBase, params)" as DevCtx
+participant "Port I/O Layer\nREAD/WRITE macros" as PortIO
+participant "COM1 I/O Port\n(0x3F8)" as COM1
+participant "VirtualBox Capture\n(file/pipe)" as VBox
+participant "DebugView / IrpTracker" as Tools
+
+== App sends data ==
+App -> Win32 : CreateFile("\\.\\SerialPort")
+App -> Win32 : WriteFile(buffer)
+Win32 -> Driver : IRP_MJ_WRITE (WDF request)
+Driver -> DevCtx : WdfRequestRetrieveInputBuffer
+Driver -> Tools : KdPrint("transmit start: byte=..")
+
+loop Poll LSR (max attempts)
+    Driver -> PortIO : READ LSR (PortBase + 5)
+    PortIO -> COM1 : IN (0x3F8 + 5)
+    COM1 --> PortIO : LSR value
+    PortIO --> Driver : return LSR
+    Driver -> Tools : KdPrint("attempt=N, LSR=0x..")
+    alt THRE set
+        Driver -> PortIO : WRITE THR (PortBase + 0)
+        PortIO -> COM1 : OUT (0x3F8)
+        PortIO --> Driver : write complete
+        Driver -> Tools : KdPrint("Byte transmitted")
+        break
+    else THRE not set
+        Driver -> Driver : KeStallExecutionProcessor(1 microsecond)
+    end
+end
+
+Driver -> Win32 : Complete IRP (Information = 1 or 0)
+Win32 -> App : WriteFile returns (bytes written)
+
+note over Tools, VBox
+  Evidence collection:
+  - KdPrint logs show polling attempts and writes
+  - IrpTracker shows IRP_MJ_WRITE events and completion
+  - VirtualBox file/pipe contains actual bytes sent
+end note
+
+@enduml

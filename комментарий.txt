@@ -1,0 +1,980 @@
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ПОЛНОЕ ПОДРОБНОЕ ОПИСАНИЕ КУРСОВОЙ РАБОТЫ
+"Драйвер передатчика последовательного порта (Serial Port Transmitter) с циклическим опросом"
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+Задача (техническое задание):
+───────────────────────────────────────────────────────────────────────────────────────────────────
+Разработать Windows kernel driver для передачи данных через последовательный порт (COM1) с использованием:
+1. Цикличского опроса (polling) готовности передатчика (THRE бит регистра LSR)
+2. API взаимодействия с пользовательским приложением через WriteFile
+3. KMDF (Kernel-Mode Driver Framework) для управления устройством
+4. VirtualBox для виртуализации и тестирования
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 1: АРХИТЕКТУРА И ОБЩЕЕ ПОНИМАНИЕ
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+1.1 Общая схема системы
+───────────────────────
+Система состоит из двух основных частей:
+  • KERNEL-MODE (защищённый режим ядра): kernel driver `serialport.sys` (KMDF)
+  • USER-MODE (пользовательский режим): приложение `write_serial.exe` (Win32)
+
+Взаимодействие:
+  User-mode app → CreateFile() → opens device object \\.\SerialPort
+                → WriteFile() → creates IRP_MJ_WRITE request
+  Kernel-mode driver → catches IRP_MJ_WRITE in EvtIoWrite callback
+                    → reads LSR register (0x3F8 + 5)
+                    → checks THRE bit (0x20)
+                    → if ready: writes THR (0x3F8 + 0)
+                    → completes IRP with bytes written (1 or 0)
+  User-mode app → receives WriteFile result
+               → if 0 bytes written: retries after delay
+               → if 1 byte written: moves to next byte
+
+────────────────────────────────────────────────────────────────────────────────
+
+1.2 Ключевые компоненты
+───────────────────────
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ USER-MODE: write_serial.exe                                         │
+  │ • CreateFile("\\\\.\\SerialPort") — открыть device                  │
+  │ • for each byte: WriteFile(device, byte, 1, &written, NULL)        │
+  │ • if written==0: Sleep(10ms) + retry (max 100)                      │
+  │ • CloseHandle(device) — закрыть device                              │
+  └─────────────────────────────────────────────────────────────────────┘
+                              ↓
+  Kernel Boundary (IRP mechanism)
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ KERNEL-MODE: serialport.sys (KMDF)                                  │
+  │                                                                      │
+  │ driver.c / DriverEntry():                                            │
+  │ • WdfDriverCreate() — инициализирует KMDF driver                    │
+  │ • регистрирует EvtDeviceAdd callback                                │
+  │                                                                      │
+  │ driver.c / SerioEvtDeviceAdd():                                      │
+  │ • вызывает SerioDeviceCreate() для создания device object           │
+  │                                                                      │
+  │ device.c / SerioDeviceCreate():                                      │
+  │ • WdfDeviceCreate() — создаёт WDFDEVICE объект                     │
+  │ • инициализирует DEVICE_CONTEXT (структура контекста)               │
+  │ • регистрирует PnP callbacks (EvtDevicePrepareHardware, Release)   │
+  │ • создаёт symbolic link \\DosDevices\\SerialPort                    │
+  │ • вызывает SerioQueueInitialize() для настройки I/O queue          │
+  │                                                                      │
+  │ device.c / SerioEvtDevicePrepareHardware():                          │
+  │ • PortBase = 0x3F8 (физический адрес COM1 в I/O space)             │
+  │ • инициализирует параметры: 9600 бод, 8 бит, 1 стоп, без чётности │
+  │                                                                      │
+  │ queue.c / SerioQueueInitialize():                                    │
+  │ • WDF_IO_QUEUE_CONFIG_INIT() — конфиг очереди                      │
+  │ • WdfIoQueueDispatchSequential — последовательная обработка         │
+  │ • регистрирует EvtIoWrite callback для IRP_MJ_WRITE                 │
+  │                                                                      │
+  │ queue.c / SerioEvtIoWrite() — ГЛАВНАЯ ФУНКЦИЯ ДРАЙВЕРА:            │
+  │ • получает WDF request с байтом для передачи                        │
+  │ • цикл опроса (polling):                                            │
+  │   - READ_PORT_UCHAR(0x3F8 + 5) → получает LSR (Line Status Reg)   │
+  │   - проверяет bit 5 (THRE — Transmitter Holding Register Empty)    │
+  │   - если THRE=1: WRITE_PORT_UCHAR(0x3F8, byte) → записываем байт   │
+  │   - если THRE=0: KeStallExecutionProcessor(1us) → пауза 1 мкс      │
+  │   - repeat while attempts < 100                                     │
+  │ • WdfRequestCompleteWithInformation(request, status, bytes_written) │
+  │   - если успех: bytes_written = 1                                   │
+  │   - если timeout: bytes_written = 0 (приложение повторит попытку)  │
+  │                                                                      │
+  │ portio_asm.h / READ_PORT_UCHAR(), WRITE_PORT_UCHAR():               │
+  │ • x86 ассемблерные вставки: mov dx, port; in al, dx / out dx, al   │
+  │ • прямой доступ к портам ввода-вывода                              │
+  │                                                                      │
+  └─────────────────────────────────────────────────────────────────────┘
+                              ↓
+  Hardware/Virtualization Boundary
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ HARDWARE / VIRTUALIZATION                                            │
+  │                                                                      │
+  │ COM1 I/O Ports (0x3F8 - 0x3FF, UART 16550):                         │
+  │ • 0x3F8 (+0): THR (Transmitter Holding Register) — write only       │
+  │ • 0x3F8 (+5): LSR (Line Status Register) — read only                │
+  │   - bit 5 (0x20): THRE (Transmitter Holding Register Empty)         │
+  │   - bit 6 (0x40): TSRE (Transmitter Shift Register Empty)           │
+  │                                                                      │
+  │ VirtualBox Serial Redirect:                                          │
+  │ • перенаправляет виртуальный COM-порт в файл или pipe              │
+  │ • пример: Host Device → E:\vb_serial_capture.bin                    │
+  │                                                                      │
+  │ DebugView / WinDbg / IrpTracker:                                     │
+  │ • отслеживают KdPrint логи (попытки опроса, значения LSR)          │
+  │ • отслеживают IRP_MJ_WRITE события и их завершения                 │
+  │                                                                      │
+  └─────────────────────────────────────────────────────────────────────┘
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 2: ДЕТАЛЬНОЕ ОБЪЯСНЕНИЕ КОДА
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+2.1 FILE: driver.c — инициализация и точка входа
+──────────────────────────────────────────────────
+
+Функция: DriverEntry()
+Параметры:
+  • PDRIVER_OBJECT DriverObject — объект драйвера в памяти
+  • PUNICODE_STRING RegistryPath — путь в реестре (реплаты после перезагрузки)
+
+Что происходит:
+  1) WDF_DRIVER_CONFIG config;
+     — подготавливаем структуру конфигурации для KMDF
+
+  2) WDF_DRIVER_CONFIG_INIT(&config, SerioEvtDeviceAdd);
+     — инициализируем конфиг, указываем SerioEvtDeviceAdd как callback для новых устройств
+     — этот callback вызовется для каждого нового COM-порта, который система найдёт
+
+  3) status = WdfDriverCreate(DriverObject, RegistryPath, ..., &config, ...);
+     — создаём KMDF driver объект
+     — от этого момента драйвер готов получать запросы от PnP manager
+
+  4) Если ошибка: KdPrint() — логируем в DebugView
+     return status (STATUS_UNSUCCESSFUL)
+
+  5) Если успех: return STATUS_SUCCESS
+
+Суть: DriverEntry — это "главный вход" драйвера. ОС вызывает эту функцию ровно один раз при загрузке 
+драйвера. Задача — инициализировать KMDF и указать, что делать при появлении новых устройств.
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: SerioEvtDeviceAdd()
+Параметры:
+  • WDFDRIVER Driver — handle на драйвер (из DriverEntry)
+  • PWDFDEVICE_INIT DeviceInit — инициализационная структура для нового устройства
+
+Что происходит:
+  1) UNREFERENCED_PARAMETER(Driver) — говорим компилятору "параметр Driver не используется"
+  
+  2) PAGED_CODE() — макрос: указывает, что этот код может быть в paged memory (не требует быть 
+     все время в памяти), поскольку вызывается нечасто (при добавлении устройства)
+
+  3) KdPrint(("Enter SerioDeviceAdd\n")) — логируем в DebugView для отладки
+
+  4) status = SerioDeviceCreate(DeviceInit) — вызываем функцию из device.c для создания объекта устройства
+
+  5) return status
+
+Суть: SerioEvtDeviceAdd — это callback, вызываемый для каждого нового найденного устройства. Здесь 
+мы просто передаём инициализацию в отдельную функцию (разделение ответственности).
+
+────────────────────────────────────────────────────────────────────────────────
+
+2.2 FILE: device.c — создание и инициализация устройства
+──────────────────────────────────────────────────────────
+
+КОНСТАНТЫ И DEFINE'Ы (вверху файла):
+
+#define COM1_BASE_ADDRESS 0x3F8
+  → физический I/O адрес COM1 в пространстве ввода-вывода (I/O space)
+  → это стандартный адрес для последовательного портов 16550 на всех x86 ПК
+
+#define UART_THR 0              → регистр THR находится на смещении +0 от базы
+#define UART_LSR 5              → регистр LSR находится на смещении +5 от базы
+#define LSR_THRE 0x20           → бит 5 в LSR, маска 0x20 (0010 0000 в binary)
+#define LCR_DLAB 0x80           → бит 7 в LCR, используется для доступа к делителю скорости
+#define LCR_WLS_8BITS 0x03      → конфигурация для 8 бит данных (bits 0-1 = 11 в binary)
+#define LCR_STOP_1BIT 0x00      → конфигурация для 1 стоп-бита (bit 2 = 0)
+#define LCR_PARITY_NONE 0x00    → без чётности (bits 3-5 = 000)
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: SerioDeviceCreate()
+
+Локальные переменные:
+  • WDF_OBJECT_ATTRIBUTES deviceAttributes — атрибуты объекта
+  • PDEVICE_CONTEXT deviceContext — контекст устройства (структура с портом, скоростью и т.д.)
+  • WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks — callbacks для PnP события
+  • WDFDEVICE device — handle на создаваемое устройство
+  • NTSTATUS status — код ошибки
+  • UNICODE_STRING ntDeviceName, win32DeviceName — имена устройства для ОС и пользователей
+
+Блок 1: Инициализация PnP callbacks
+─────────────────────────────────────
+  WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
+  → инициализируем структуру нулями
+
+  pnpPowerCallbacks.EvtDevicePrepareHardware = SerioEvtDevicePrepareHardware;
+  → регистрируем callback, который будет вызван ДО того, как драйвер начнёт работать с железом
+  → здесь мы настроим порт (установим скорость, бит-конфиг и т.д.)
+
+  pnpPowerCallbacks.EvtDeviceReleaseHardware = SerioEvtDeviceReleaseHardware;
+  → регистрируем callback, который будет вызван ПОСЛЕ того, как драйвер закончит работу
+  → здесь мы освобождаем ресурсы (если бы у нас было динамическое выделение)
+
+  WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
+  → передаём эти callbacks в инициализационную структуру
+
+Блок 2: Инициализация контекста
+──────────────────────────────
+  WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, DEVICE_CONTEXT);
+  → говорим WDF "у нашего device object будет контекст типа DEVICE_CONTEXT"
+  → это позволяет WDF автоматически выделять и освобождать память под контекст
+
+  WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, WDF_NO_EVENT_CALLBACK, ...);
+  → конфигурируем обработку открытия/закрытия файлов
+  → мы не обрабатываем эти события, поэтому WDF_NO_EVENT_CALLBACK
+
+  fileConfig.AutoForwardCleanupClose = WdfFalse;
+  → не автоматически закрывать запросы при закрытии файла
+
+  WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileConfig, ...);
+  → передаём конфиг в инициализацию
+
+Блок 3: Назначение имени устройства
+────────────────────────────────────
+  RtlInitUnicodeString(&ntDeviceName, SERIO_DEVICE_NAME);
+  → инициализируем Unicode строку с kernel-mode именем (из driver.h: "\\Device\\SerialPort0")
+
+  status = WdfDeviceInitAssignName(DeviceInit, &ntDeviceName);
+  → присваиваем это имя устройству
+  → ОС будет обращаться к устройству по этому имени внутри ядра
+
+Блок 4: Создание объекта устройства
+────────────────────────────────────
+  WdfDeviceInitSetDeviceType(DeviceInit, SERIO_TYPE);
+  → указываем тип устройства (из driver.h: 40001 — произвольный тип)
+
+  WdfDeviceInitSetPowerPageable(DeviceInit);
+  → говорим, что наше устройство может быть в paged memory (не критично для отклика)
+
+  status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
+  → РЕАЛЬНО СОЗДАЁМ объект устройства!
+  → в этот момент выделяется память, регистрируется в ОС, готовится контекст
+  → если ошибка: return status
+
+Блок 5: Инициализация контекста устройства
+──────────────────────────────────────────
+  deviceContext = SerioGetDeviceContext(device);
+  → получаем указатель на структуру DEVICE_CONTEXT для нашего устройства
+  → это структура, где мы будем хранить PortBase, скорость, параметры и т.д.
+
+  deviceContext->PortMemoryType = 1;
+  → 1 = I/O space (порты), 0 = memory space (память)
+
+  deviceContext->PortCount = COM_PORT_COUNT;
+  → количество портов на контроллере (обычно 8)
+
+  deviceContext->BaudRate = 9600;
+  deviceContext->DataBits = 8;
+  deviceContext->StopBits = 1;
+  deviceContext->Parity = 0;
+  → сохраняем параметры для последующего использования в EvtDevicePrepareHardware
+
+Блок 6: Создание symbolic link для user-mode доступа
+─────────────────────────────────────────────────────
+  RtlInitUnicodeString(&win32DeviceName, SERIO_DOS_DEVICE_NAME);
+  → инициализируем Unicode строку с user-mode именем (из driver.h: "\\DosDevices\\SerialPort")
+
+  status = WdfDeviceCreateSymbolicLink(device, &win32DeviceName);
+  → создаём символическую ссылку
+  → благодаря этому пользовательское приложение может открыть устройство через
+    CreateFile("\\\\.\\SerialPort") ← двойные обратные слэши нужны в C-строках
+    что перерешается системой в \\DosDevices\\SerialPort → \\Device\\SerialPort0
+
+Блок 7: Инициализация I/O Queue
+────────────────────────────────
+  status = SerioQueueInitialize(device);
+  → вызываем функцию из queue.c для создания очереди обработки I/O запросов
+  → здесь регистрируется callback EvtIoWrite для обработки WriteFile
+
+  return status;
+  → возвращаем статус (успех или ошибка)
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: SerioEvtDevicePrepareHardware()
+
+Параметры:
+  • WDFDEVICE Device — handle на устройство
+  • WDFCMRESLIST ResourceList — "сырые" ресурсы (как в BIOS/ACPI)
+  • WDFCMRESLIST ResourceListTranslated — переведённые ресурсы (физические адреса)
+
+Что происходит:
+  1) UNREFERENCED_PARAMETER(ResourceList); UNREFERENCED_PARAMETER(ResourceListTranslated);
+     → параметры ресурсов не используются, потому что мы используем фиксированный адрес 0x3F8
+     → в реальном драйвере нужно парсить эти ресурсы для получения адреса из PnP
+
+  2) deviceContext = SerioGetDeviceContext(Device);
+     → получаем контекст, который мы инициализировали в SerioDeviceCreate
+
+  3) deviceContext->PortBase = (PVOID)(ULONG_PTR)COM1_BASE_ADDRESS;
+     → устанавливаем PortBase = 0x3F8
+     → это адрес, который будет использоваться в EvtIoWrite для чтения/записи регистров
+     → (PVOID)(ULONG_PTR) — приводим целое число к указателю (не как память, а как адрес портов)
+
+  4) deviceContext->PortWasMapped = FALSE;
+     → флаг: не использовали MmMapIoSpace (теплый хардкодом, не надо размапить)
+
+  5) KdPrint(("SerioEvtDevicePrepareHardware: Serial port at 0x%p\n", deviceContext->PortBase));
+     → логируем в DebugView для подтверждения инициализации
+
+  6) return STATUS_SUCCESS;
+
+Суть: EvtDevicePrepareHardware вызывается системой перед тем, как драйвер начнёт обрабатывать 
+запросы. Здесь мы инициализируем PortBase и другие аппаратные ресурсы.
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: SerioEvtDeviceReleaseHardware()
+
+Параметры:
+  • WDFDEVICE Device — handle на устройство
+  • WDFCMRESLIST ResourceListTranslated — переведённые ресурсы
+
+Что происходит:
+  1) deviceContext = SerioGetDeviceContext(Device);
+     → получаем контекст
+
+  2) if (deviceContext->PortWasMapped) {
+     // MmUnmapIoSpace(deviceContext->PortBase, deviceContext->PortCount);
+     }
+     → условная разборка ввода-вывода памяти (комментировано, потому что мы не использовали MmMapIoSpace)
+
+  3) KdPrint(("SerioEvtDeviceReleaseHardware: Cleaning up serial port\n"));
+     → логируем удаление
+
+  4) return STATUS_SUCCESS;
+
+Суть: EvtDeviceReleaseHardware вызывается системой при удалении или остановке устройства. 
+Здесь мы освобождаем ресурсы.
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+2.3 FILE: queue.c — очередь и цикличный опрос (главная логика!)
+──────────────────────────────────────────────────────────────────
+
+КОНСТАНТЫ:
+#define LSR_THRE    0x20       → маска для бита THRE в регистре LSR
+#define LSR_TSRE    0x40       → маска для бита TSRE (используется в логировании)
+#define MAX_TX_ATTEMPTS 100    → максимум попыток опроса (100)
+#define TX_POLL_DELAY 1        → задержка между попытками (1 микросекунда)
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: SerioQueueInitialize()
+
+Параметры:
+  • WDFDEVICE Device — handle на устройство
+
+Что происходит:
+  1) WDF_IO_QUEUE_CONFIG queueConfig;
+     → создаём локальную структуру конфигурации очереди
+
+  2) WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
+     → инициализируем конфиг для DEFAULT очереди с SEQUENTIAL (последовательной) обработкой
+     → WdfIoQueueDispatchSequential означает: обрабатывать запросы один за другим (не параллельно)
+     → default очередь = очередь для всех IRP_MJ_XXX, которые не обработаны другими очередями
+
+  3) queueConfig.EvtIoWrite = SerioEvtIoWrite;
+     → регистрируем callback для IRP_MJ_WRITE (WriteFile из user-mode)
+     → теперь каждый раз, когда приложение вызывает WriteFile, будет вызван SerioEvtIoWrite
+
+  4) status = WdfIoQueueCreate(Device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
+     → РЕАЛЬНО СОЗДАЁМ очередь на устройстве!
+     → если ошибка: KdPrint + return status
+
+  5) return status;
+
+Суть: SerioQueueInitialize создаёт очередь обработки I/O запросов и регистрирует EvtIoWrite как 
+обработчик WriteFile запросов.
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: SerioEvtIoWrite() — ГЛАВНАЯ ФУНКЦИЯ, КОТОРАЯ ДЕЛАЕТ ВСЮ РАБОТУ!
+
+Параметры:
+  • WDFQUEUE Queue — очередь, из которой пришел запрос
+  • WDFREQUEST Request — handle на IRP (I/O Request Packet)
+  • size_t Length — размер буфера (обычно 1 байт в нашем случае)
+
+Локальные переменные:
+  • PDEVICE_CONTEXT devContext — контекст устройства (где хранится PortBase)
+  • PUCHAR pBuffer — указатель на буфер с данными для передачи
+  • NTSTATUS status — код ошибки
+  • WDFDEVICE device — handle на устройство
+  • size_t bytesWritten — сколько байт передалось (0 или 1)
+  • UCHAR lsr — значение регистра LSR (Line Status Register)
+  • UCHAR txByte — байт для передачи
+  • int attempts — счётчик попыток опроса
+
+Блок 1: Получение device context и проверка буфера
+──────────────────────────────────────────────────
+  device = WdfIoQueueGetDevice(Queue);
+  → из очереди получаем device object
+
+  devContext = SerioGetDeviceContext(device);
+  → из device object получаем контекст (где лежит PortBase = 0x3F8)
+
+  PAGED_CODE();
+  → макрос: этот код может быть в paged memory
+
+  if (Length == 0) {
+      status = STATUS_INVALID_PARAMETER;
+      goto exit;
+  }
+  → если buffer пуст: ошибка, прыгаем в exit
+
+  status = WdfRequestRetrieveInputBuffer(Request, Length, &pBuffer, NULL);
+  if (!NT_SUCCESS(status)) {
+      goto exit;
+  }
+  → получаем указатель на user-mode буфер (WDF копирует данные в kernel memory)
+  → если ошибка: прыгаем в exit
+
+Блок 2: Подготовка к передаче
+───────────────────────────────
+  txByte = pBuffer[0];
+  → берём первый байт из буфера
+
+  attempts = 0;
+  → инициализируем счётчик попыток
+
+  KdPrint(("SerioEvtIoWrite: transmit start - byte=0x%02X, max_attempts=%d\n", txByte, MAX_TX_ATTEMPTS));
+  → логируем какой байт передаём (для отладки в DebugView)
+
+Блок 3: ГЛАВНЫЙ ЦИКЛ ОПРОСА (THE HEART OF THE DRIVER!)
+────────────────────────────────────────────────────
+  while (attempts < MAX_TX_ATTEMPTS) {
+
+    // 3.1 Читаем LSR регистр
+    ────────────────────────
+    lsr = READ_PORT_UCHAR((PUCHAR)((ULONG_PTR)devContext->PortBase + 5));
+    
+    Разбор:
+    • devContext->PortBase = 0x3F8 (base address COM1 в I/O space)
+    • + 5 = 0x3FD (адрес регистра LSR)
+    • (ULONG_PTR) приводим PVOID к unsigned long (целое число)
+    • (PUCHAR) приводим целое число к указателю на byte
+    • READ_PORT_UCHAR — макрос из portio_asm.h, выполняет "in al, dx" (x86 asm)
+    
+    Результат: lsr содержит байт из LSR регистра, например 0x60 (содержит разные биты статуса)
+
+    // 3.2 Логируем значение LSR
+    ──────────────────────────
+    KdPrint(("SerioEvtIoWrite: attempt=%d, LSR=0x%02X\n", attempts + 1, lsr));
+    
+    Для отладки показываем номер попытки и значение LSR
+
+    // 3.3 Проверяем THRE бит
+    ───────────────────────
+    if (lsr & LSR_THRE) {  // если (lsr & 0x20) != 0
+
+    LSR регистр:
+    bit 0 (0x01): DR   (Data Ready) — есть входящие данные
+    bit 1 (0x02): OE   (Overrun Error)
+    bit 2 (0x04): PE   (Parity Error)
+    bit 3 (0x08): FE   (Framing Error)
+    bit 4 (0x10): BI   (Break Interrupt)
+    bit 5 (0x20): THRE (Transmitter Holding Register Empty) ← НАС ИНТЕРЕСУЕТ ЭТО!
+    bit 6 (0x40): TSRE (Transmitter Shift Register Empty)
+    bit 7 (0x80): RFE  (Receiver FIFO Error)
+
+    THRE=1 означает: "Transmitter Holding Register пуст, я готов принять новый байт"
+    Это ровно то, что нам нужно для передачи!
+
+    // 3.4 Если THRE=1: записываем байт в THR
+    ─────────────────────────────────────────
+    WRITE_PORT_UCHAR((PUCHAR)((ULONG_PTR)devContext->PortBase + 0), txByte);
+
+    • devContext->PortBase + 0 = 0x3F8 (адрес THR — Transmitter Holding Register)
+    • WRITE_PORT_UCHAR — макрос из portio_asm.h, выполняет "out dx, al" (x86 asm)
+    • txByte — байт, который мы передаём
+    
+    ЭТОТ МОМЕНТ = РЕАЛЬНАЯ ПЕРЕДАЧА БАЙТА! Когда мы пишем в THR, UART берёт этот байт
+    и начинает его передавать по линии (начнёт с start bit, потом 8 бит данных, потом stop bit)
+
+    // 3.5 Завершение успешной передачи
+    ────────────────────────────────────
+    bytesWritten = 1;
+    KdPrint(("SerioEvtIoWrite: Byte 0x%02X transmitted\n", txByte));
+    break;  // выходим из цикла while
+
+    } // конец if (lsr & LSR_THRE)
+
+    // 3.6 Если THRE=0: ждём следующую попытку
+    ──────────────────────────────────────────
+    else {
+        attempts++;  // увеличиваем счётчик попыток
+        KeStallExecutionProcessor(TX_POLL_DELAY);  // задержка 1 микросекунда
+    }
+
+    KeStallExecutionProcessor(N) — встроенная функция WDK, остановка CPU на N микросекунд
+    Это "busy wait" (активное ожидание, CPU занят), не мешаем другим потокам благодаря мощности CPU
+
+  } // конец while (attempts < MAX_TX_ATTEMPTS)
+
+Блок 4: Проверка таймаута
+──────────────────────────
+  if (attempts >= MAX_TX_ATTEMPTS) {
+      KdPrint(("SerioEvtIoWrite: Transmitter not ready (timeout)\n"));
+      bytesWritten = 0;
+  }
+
+  Если мы выши из цикла because attempts >= 100:
+  • логируем ошибку таймаута
+  • bytesWritten = 0 (ни одного байта не передалось)
+  • приложение в user-mode получит WriteFile returning 0 bytes
+  • и повторит попытку (sleep + WriteFile снова)
+
+Блок 5: Завершение IRP
+──────────────────────
+  exit:
+  WdfRequestCompleteWithInformation(Request, status, bytesWritten);
+
+  • Request — handle на IRP (I/O Request Packet)
+  • status — код ошибки (STATUS_SUCCESS или STATUS_INVALID_PARAMETER)
+  • bytesWritten — 1 (успех) или 0 (таймаут)
+
+  Эта функция "закрывает" IRP и возвращает управление user-mode приложению
+  Приложение в CreateFile() получит возвращаемый код и количество написанных байт
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+2.4 FILE: portio_asm.h — низкоуровневый доступ к I/O портам
+─────────────────────────────────────────────────────────────
+
+Макросы READ_PORT_UCHAR и WRITE_PORT_UCHAR реализуют прямой доступ к портам ввода-вывода 
+используя x86 ассемблерные команды:
+
+READ_PORT_UCHAR(port):
+  — выполняет x86 команду: mov dx, port; in al, dx
+  — результат (байт из порта) возвращается в al и в return value функции
+
+WRITE_PORT_UCHAR(port, value):
+  — выполняет x86 команду: mov dx, port; mov al, value; out dx, al
+  — записывает value в порт
+
+Это критично для прямого доступа к I/O адресам (0x3F8 - 0x3FF). 
+Нельзя просто скопировать память как обычно — это специальные I/O операции.
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+2.5 FILE: app/write_serial.c — пользовательское приложение
+─────────────────────────────────────────────────────────────
+
+ПАРАМЕТРЫ И КОНСТАНТЫ:
+
+#define DEVICE_PATH "\\\\.\\SerialPort"
+  → путь для открытия (double backslash из-за C-строк)
+  → система перерешает это в \\DosDevices\\SerialPort → \\Device\\SerialPort0
+
+#define MAX_TX_ATTEMPTS 100
+  → максимум повторений на одном байте (100)
+
+#define TX_POLL_DELAY 10
+  → задержка между повторениями (10 миллисекунд)
+
+────────────────────────────────────────────────────────────────────────────────
+
+Функция: main()
+
+Параметры:
+  • int argc — количество аргументов командной строки
+  • char *argv[] — аргументы (argv[0] = имя программы, argv[1] = первая строка и т.д.)
+
+Блок 1: Инициализация
+──────────────────────
+  HANDLE hDevice = INVALID_HANDLE_VALUE;
+  → handle на открытое устройство (изначально невалидный)
+
+  DWORD dwBytesWritten = 0;
+  → сколько байт передалось в последнем WriteFile
+
+  CHAR strData[256] = "Hello, Serial Port!";
+  DWORD dwDataLen = 0;
+  → буфер для строки и её длина
+
+  if (argc > 1) {
+      strcpy_s(strData, sizeof(strData), argv[1]);
+  }
+  → если приложение запущено с аргументом (например write_serial.exe "Test string")
+    то используем этот аргумент вместо default строки
+
+  dwDataLen = (DWORD)strlen(strData);
+  → вычисляем длину строки
+
+Блок 2: Открытие устройства
+─────────────────────────────
+  hDevice = CreateFile(
+      DEVICE_PATH,           // "\\\\.\\SerialPort"
+      GENERIC_WRITE,         // нам нужна возможность записи
+      FILE_SHARE_WRITE,      // другие процессы могут открыть для записи
+      NULL,                  // security attributes (по умолчанию)
+      OPEN_EXISTING,         // открыть существующее (не создавать)
+      FILE_ATTRIBUTE_NORMAL, // обычные атрибуты
+      NULL                   // нет шаблона
+  );
+
+  if (hDevice == INVALID_HANDLE_VALUE) {
+      printf("Error: Cannot open device %ws (error: 0x%x)\n", DEVICE_PATH, GetLastError());
+      return 1;
+  }
+
+  printf("Device opened successfully\n");
+
+  Если успешно открыли:
+  • hDevice содержит валидный handle
+  • можем теперь вызывать WriteFile
+
+Блок 3: Передача каждого байта
+───────────────────────────────
+  for (i = 0; i < dwDataLen; i++) {
+      cByte = strData[i];  // текущий байт для передачи
+      nAttempts = 0;       // счётчик попыток
+
+      while (nAttempts < MAX_TX_ATTEMPTS) {
+
+          if (WriteFile(
+              hDevice,      // handle на драйвер
+              &cByte,       // адрес буфера (1 байт)
+              1,            // сколько байт передать (всегда 1)
+              &dwBytesWritten,  // [OUT] сколько реально передалось
+              NULL          // asynchronous (не используем)
+          )) {
+
+              if (dwBytesWritten == 1) {
+                  printf("Byte %d (0x%02X '%c') transmitted successfully\n", 
+                         i, cByte, (cByte >= 32 && cByte < 127) ? cByte : '?');
+                  break;  // успех, переходим к следующему байту
+              } else {
+                  // dwBytesWritten == 0 (драйвер вернул таймаут)
+                  nAttempts++;
+                  
+                  if (nAttempts >= MAX_TX_ATTEMPTS) {
+                      printf("Byte %d (0x%02X '%c') transmission timeout\n",
+                             i, cByte, (cByte >= 32 && cByte < 127) ? cByte : '?');
+                  } else {
+                      Sleep(TX_POLL_DELAY);  // ждём 10 миллисекунд
+                  }
+              }
+          } else {
+              // WriteFile вернул FALSE (ошибка)
+              printf("Error: WriteFile failed for byte %d (error: 0x%x)\n",
+                     i, GetLastError());
+              break;
+          }
+      } // конец while (nAttempts < MAX_TX_ATTEMPTS)
+  } // конец for (i = 0; i < dwDataLen; i++)
+
+Блок 4: Закрытие устройства и завершение
+──────────────────────────────────────────
+  printf("Transmission complete\n");
+
+  if (hDevice != INVALID_HANDLE_VALUE) {
+      CloseHandle(hDevice);
+  }
+
+  return 0;
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 3: ПОЛНЫЙ ПОТОК ВЫПОЛНЕНИЯ (ШАГ ЗА ШАГОМ)
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+Сценарий: пользователь запускает write_serial.exe "AB"
+
+ШАГИ:
+
+1. main() → CreateFile("\\\\.\\SerialPort")
+   → система переводит это в \\DosDevices\\SerialPort → \\Device\\SerialPort0 (наше устройство)
+   → происходит вызов в kernel-mode (переход из user-mode в kernel-mode)
+
+2. Kernel detects device open request → kernel-mode код
+   → устройство уже создано и инициализировано (на момент загрузки драйвера)
+   → просто возвращаем handle (HANDLE) пользовательскому приложению
+
+3. main() → WriteFile(hDevice, "A", 1, &written, NULL)
+   → создаётся IRP_MJ_WRITE запрос в ядре
+   → WDF помещает его в очередь (q SerioQueueInitialize)
+   → вызывает SerioEvtIoWrite callback
+
+4. SerioEvtIoWrite() в ядре:
+   a) Получаем byte 'A' (0x41) из буфера
+   b) attempts = 0
+   c) Цикл while:
+      - Читаем LSR из порта 0x3FD (READ_PORT_UCHAR)
+      - Проверяем бит THRE (0x20)
+      
+      Вариант A: THRE установлен (готово)
+      - Пишем 0x41 в THR (0x3F8)
+      - bytesWritten = 1
+      - break из цикла
+      
+      Вариант B: THRE не установлен (не готово)
+      - attempts++
+      - KeStallExecutionProcessor(1) — ждём 1 микросекунду
+      - loop (повторяем)
+
+   d) WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 1)
+   → IRP завершается, управление возвращается user-mode
+
+5. WriteFile вернула TRUE, dwBytesWritten = 1
+   → printf("Byte %d transmitted successfully")
+   → break из while (переходим к следующему байту)
+
+6. main() → WriteFile(hDevice, "B", 1, &written, NULL)
+   → повторяем то же самое для 'B' (0x42)
+
+7. Цикл завершается, printf("Transmission complete")
+
+8. CloseHandle(hDevice)
+   → в ядре вызывается EvtDeviceReleaseHardware (cleanup)
+
+9. return 0
+   → приложение завершается
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 4: КЛЮЧЕВЫЕ КОНЦЕПЦИИ И ПОНИМАНИЕ
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+4.1 Что такое IRP и почему это важно?
+──────────────────────────────────────
+IRP = I/O Request Packet
+
+Это структура в ядре, которая описывает запрос от user-mode приложения:
+• Что нужно сделать (IRP_MJ_WRITE, IRP_MJ_READ и т.д.)
+• Какой буфер использовать (адрес и размер в kernel memory)
+• Какой device target (какое устройство обрабатывает запрос)
+• Статус выполнения (в процессе, завершено, ошибка)
+
+Когда приложение вызывает WriteFile:
+• ОС создаёт IRP_MJ_WRITE и передаёт его в очередь драйвера
+• Драйвер обрабатывает в callback (EvtIoWrite)
+• Драйвер заполняет статус и результат
+• ОС извлекает результат и возвращает приложению
+
+────────────────────────────────────────────────────────────────────────────────
+
+4.2 Что такое KMDF и почему мы это используем?
+────────────────────────────────────────────────
+KMDF = Kernel-Mode Driver Framework
+
+Это фреймворк от Microsoft, который упрощает разработку kernel драйверов:
+• Вместо работы с IRP и низкоуровневыми структурами напрямую
+• KMDF предоставляет callbacks (EvtDeviceAdd, EvtIoWrite, EvtDevicePrepareHardware и т.д.)
+• Мы просто регистрируем нужные callbacks и пишем в них логику
+• KMDF сам управляет памятью, callbacks, синхронизацией
+
+Альтернатива: WDM (Windows Driver Model) — ниже уровнем, сложнее, но больше контроля
+
+────────────────────────────────────────────────────────────────────────────────
+
+4.3 Почему циклический опрос (polling) вместо прерываний?
+──────────────────────────────────────────────────────────
+UART обычно генерирует прерывания при готовности передатчика, но мы использовали polling.
+
+Причины:
+• Простота: не надо писать ISR (Interrupt Service Routine)
+• Демонстрация: нужно показать "опрос готовности", а не обработку прерываний
+• Виртуализация: в VirtualBox перехват и обработка прерываний может быть сложнее
+
+Недостатки polling:
+• CPU загруженность: мы "занимаем" CPU KeStallExecutionProcessor в цикле
+• Задержка: мы ждём и проверяем вместо того, чтобы получить сигнал о готовности
+
+Реальный production драйвер: использовал бы ISR + DPC (Deferred Procedure Call)
+
+────────────────────────────────────────────────────────────────────────────────
+
+4.4 Почему 0x3F8 и стандартные UART адреса?
+───────────────────────────────────────────
+0x3F8 - 0x3FF (8 портов) = стандартный I/O диапазон для COM1 на x86 архитектуре
+
+Стандарт установлен десятилетия назад (IBM PC):
+• COM1: 0x3F8 - 0x3FF
+• COM2: 0x2F8 - 0x2FF
+• COM3: 0x3E8 - 0x3EF
+• COM4: 0x2E8 - 0x2EF
+
+В VirtualBox и реальном оборудовании эти адреса остаются неизменными.
+
+────────────────────────────────────────────────────────────────────────────────
+
+4.5 Что происходит в VirtualBox?
+──────────────────────────────────
+VirtualBox виртуализирует I/O порты:
+• Когда драйвер в гостевой ОС выполняет IN/OUT инструкции (READ_PORT/WRITE_PORT)
+• VirtualBox перехватывает эти инструкции (гостевая ОС работает не на реальном CPU)
+• VirtualBox эмулирует UART (регистры LSR, THR и т.д.)
+• VirtualBox может перенаправить выход в файл, pipe, сокет и т.д.
+
+Например:
+• Гостевая ОС пишет байт в 0x3F8 (WRITE_PORT_UCHAR)
+• VirtualBox перехватывает эту инструкцию
+• VirtualBox логирует байт в файл E:\vb_serial_capture.bin (если так настроено)
+
+────────────────────────────────────────────────────────────────────────────────
+
+4.6 Как отладка (DebugView, IrpTracker) помогает нам?
+──────────────────────────────────────────────────────
+DebugView:
+• Показывает все KdPrint() сообщения из ядра
+• Мы видим: попытку опроса, значение LSR, успешное написание
+• Позволяет убедиться, что драйвер действительно выполнял ожидаемые операции
+
+IrpTracker:
+• Перехватывает все IRP запросы в системе
+• Для каждого IRP показывает: тип (WRITE, READ и т.д.), устройство, статус, результат
+• Мы видим: IRP_MJ_WRITE пришёл в наш драйвер, завершился с Information=1 (1 байт)
+• Подтверждает, что приложение реально взаимодействовало с драйвером
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 5: ВАЖНЫЕ ДЕТАЛИ И ТОНКОСТИ
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+5.1 Почему в EvtIoWrite передаём только 1 байт, а не весь буфер?
+──────────────────────────────────────────────────────────────────
+В нашей реализации:
+• Приложение передаёт 1 байт за раз через WriteFile
+• Драйвер передаёт этот 1 байт на COM порт
+• Приложение повторяет для следующего байта
+
+Мы могли бы:
+• Передать весь буфер, но это был бы цикл в EvtIoWrite
+• Или использовать очередь внутренних запросов для асинхронной передачи
+
+Но в нашем варианте просто и ясно: 1 WriteFile = 1 byte transmitted (или timeout).
+
+────────────────────────────────────────────────────────────────────────────────
+
+5.2 Что означает "Sequential" обработка в очереди?
+───────────────────────────────────────────────────
+WdfIoQueueDispatchSequential означает:
+• Если два WriteFile пришли одновременно, второй ждёт завершения первого
+• EvtIoWrite не будет вызвана параллельно для разных IRP
+• Это гарантирует, что мы не будем писать в COM порт одновременно из разных потоков
+
+Альтернатива: WdfIoQueueDispatchParallel — несколько IRP обрабатываются одновременно (требует синхронизации).
+
+────────────────────────────────────────────────────────────────────────────────
+
+5.3 Что такое DEVICE_CONTEXT и почему он важен?
+────────────────────────────────────────────────
+DEVICE_CONTEXT — это структура, которая хранит данные, специфичные для конкретного устройства:
+• PortBase (0x3F8) — адрес порта
+• BaudRate (9600) — скорость передачи
+• DataBits, StopBits, Parity — параметры UART
+
+Каждое устройство может иметь разные параметры, поэтому мы храним их в контексте.
+
+Преимущества:
+• Если в системе несколько COM портов, каждый может иметь отдельный DEVICE_CONTEXT
+• Драйвер может обслуживать несколько устройств параллельно (если бы PnP добавил их)
+
+В нашем случае: одно устройство = один контекст.
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 6: КОМПИЛЯЦИЯ И СБОРКА
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+6.1 Процесс сборки
+──────────────────
+Файлы конфигурации:
+• sources — WDK конфиг (что компилировать, целевое имя, версия KMDF и т.д.)
+• makefile — стандартный WDK makefile
+• makefile.inc — локальные переопределения (обычно пусто в нашем случае)
+
+Команда сборки на Windows:
+  E:\3> build -cZ
+  
+  Параметры:
+  -c = clean (удалить старые файлы перед сборкой)
+  -Z = no link (только компилировать, не компоновать) / или -c сборка и компоновка
+  На практике: build -c = clean + compile + link
+
+Результат:
+  objchk_wxp_x86\i386\serialport.sys → готовый kernel driver
+
+Приложение:
+  cd app
+  build -c
+  
+  Результат:
+  app\objchk_wxp_x86\i386\write_serial.exe → готовое приложение
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЧАСТЬ 7: УСТАНОВКА И ЗАПУСК НА VIRTUALBOX
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+7.1 Установка драйвера
+──────────────────────
+1) На VM скопировать serialport.sys и serialport.inf в папку (например C:\Drivers\)
+
+2) Заходим в Device Manager → Update Driver Software → Browse my computer
+   → выбираем C:\Drivers\ и выбираем serialport.inf
+
+3) ОС инсталлирует драйвер, загружает serialport.sys в kernel memory
+
+4) Устройство появляется в Device Manager
+
+7.2 Запуск приложения
+────────────────────
+E:\3\app> write_serial.exe "Test message"
+
+Это запускает:
+• CreateFile("\\\\.\\SerialPort") → открывает наше устройство
+• for each byte в "Test message": WriteFile(device, byte, 1, &written)
+• CloseHandle(device)
+
+7.3 Сбор логов для отчёта
+──────────────────────────
+• DebugView: видим KdPrint сообщения про попытки опроса
+• IrpTracker: видим IRP_MJ_WRITE events
+• VirtualBox capture файл (E:\vb_serial_capture.bin): содержит реальные байты (если настроен)
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ЗАКЛЮЧЕНИЕ И КЛЮЧЕВЫЕ МОМЕНТЫ ДЛЯ ПРЕПОДАВАТЕЛЯ
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+ЧТО МЫ РЕАЛИЗОВАЛИ:
+
+1. Kernel-Mode KMDF Driver:
+   • Инициализирует устройство через DriverEntry → SerioEvtDeviceAdd → SerioDeviceCreate
+   • Регистрирует callbacks для PnP: EvtDevicePrepareHardware, EvtDeviceReleaseHardware
+   • Создаёт I/O очередь для обработки WriteFile запросов
+   • Реализует EvtIoWrite с циклическим опросом LSR.THRE бита
+
+2. Циклический опрос (Polling):
+   • В EvtIoWrite читаем регистр LSR на адресе PortBase+5 (0x3FD)
+   • Проверяем THRE бит (0x20 маска)
+   • При готовности пишем THR на адресе PortBase+0 (0x3F8)
+   • При неготовности: пауза 1мкс и повтор (max 100 раз)
+
+3. User-Mode Application:
+   • Открывает устройство через CreateFile("\\\\.\\SerialPort")
+   • Передаёт каждый байт через WriteFile
+   • При таймауте (0 bytes returned): повторяет попытку (max 100 раз, с задержкой 10мс)
+
+4. Взаимодействие User ↔ Kernel через IRP:
+   • WriteFile создаёт IRP_MJ_WRITE запрос
+   • KMDF очередь доставляет в EvtIoWrite callback
+   • Драйвер обрабатывает и возвращает результат (1 или 0 bytes)
+   • WriteFile возвращает результат в user-mode
+
+5. Тестирование и Валидация:
+   • DebugView показывает попытки опроса и значения LSR
+   • IrpTracker показывает IRP события
+   • VirtualBox capture файл содержит реальные байты из COM порта
+
+КАК РАССКАЗАТЬ ПРЕПОДАВАТЕЛЮ (в случае вопросов):
+
+"В EvtIoWrite мы циклически (в цикле while) читаем LSR регистр, проверяем THRE бит:
+- Если THRE=1 (готово): пишем THR и завершаем IRP с Information=1
+- Если THRE=0 (не готово): ждём 1 микросекунду и повторяем (max 100 раз)
+- Если 100 попыток исчерпаны: завершаем с Information=0, приложение повторит
+
+Это SYNCHRONOUS polling (синхронный опрос в контексте потока IRP), не асинхронный,
+не прерывание-управляемый. Драйвер блокирует текущий поток, пока не передаст или не таймаутит."
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+КОНЕЦ ПОДРОБНОГО ОПИСАНИЯ
+════════════════════════════════════════════════════════════════════════════════════════════════════

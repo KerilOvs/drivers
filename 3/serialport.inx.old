@@ -1,0 +1,39 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+DriverVer=01/01/2024,1.0.0.0
+CatalogFile=serialport.cat
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%SerialPort.DeviceDesc%=SerialPort_Device, ROOT\SerialPort
+
+[SerialPort_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+serialport.sys
+
+[SerialPort_Device.NT.Services]
+AddService = SerialPort,%SPSVCINST_ASSOCSERVICE%,SerialPort_Service_Inst
+
+[SerialPort_Service_Inst]
+DisplayName    = %SerialPort.SVCDESC%
+ServiceType    = %SERVICE_KERNEL_DRIVER%
+StartType      = %SERVICE_DEMAND_START%
+ErrorControl   = %SERVICE_ERROR_NORMAL%
+ServiceBinary  = %12%\serialport.sys
+
+[Strings]
+ManufacturerName="Serial Port Driver"
+SerialPort.DeviceDesc="Serial Port Transmitter Driver"
+SerialPort.SVCDESC="Serial Port Transmitter Service"
+SERVICE_KERNEL_DRIVER=1
+SERVICE_DEMAND_START=3
+SERVICE_ERROR_NORMAL=1
+SPSVCINST_ASSOCSERVICE=0x00000002
+

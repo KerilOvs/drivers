@@ -1,0 +1,13 @@
+TARGETNAME=serialport
+TARGETTYPE=DRIVER
+
+KMDF_VERSION_MAJOR=1
+
+MSC_WARNING_LEVEL=/W4 /WX
+
+C_DEFINES= 
+
+SOURCES=driver.c  \
+        device.c  \
+        queue.c
+

@@ -1,0 +1,10 @@
+TARGETNAME=write_serial
+TARGETTYPE=PROGRAM
+
+USE_MSVCRT=1
+UMTYPE=console
+
+
+C_DEFINES=/WX-
+SOURCES=write_serial.c
+
